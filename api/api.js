@@ -1,141 +1,59 @@
+// pages/api/index.ts
+import { NextApiRequest, NextApiResponse } from "next";
 import { createClient } from "@supabase/supabase-js";
+import pino from "pino";
 
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// استخدم service_role لأننا في الخادم
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
 );
 
-export default async function handler(req, res) {
-  res.setHeader("Content-Type", "application/json");
+type BoxReward = { success: true; reward: number };
+type WaitRes   = { error: "wait"; wait: number };
+type ErrorRes  = { error: string };
 
-  const { action, userID, ref } = req.query;
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<BoxReward | WaitRes | ErrorRes>
+) {
+  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
-  if (!action || !userID) {
-    return res.status(400).json({ error: "Missing parameters" });
-  }
+  const { action, userID, ref } = req.query as Record<string, string | undefined>;
 
-  // ✅ 1 — تأكد أن المستخدم موجود، وإن لم يوجد يتم إنشاؤه
-  async function getOrCreateUser() {
-    const { data: user } = await supabase
-      .from("players")
-      .select("*")
-      .eq("user_id", userID)
-      .single();
+  /* ---------- 1. Validation ---------- */
+  if (!action || !userID) return res.status(400).json({ error: "Missing parameters" });
+  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(userID)) return res.status(400).json({ error: "Invalid userID" });
 
-    if (user) return user;
-
-    // ✅ Create new user
-    const newUser = {
-      user_id: userID,
-      points: 0,
-      usdt: 0,
-      invited: 0,
-      referrer: ref || null,
-      lastbox: 0,
-      lastbonus: 0,
-    };
-
-    await supabase.from("players").insert([newUser]);
-    return newUser;
-  }
-
-  const user = await getOrCreateUser();
-
-  // ✅ 2 — SYSTEM ACTIONS
-  switch (action) {
-
-    // ✅ Get Balance
-    case "getBalance":
-      return res.json({
-        success: true,
-        points: user.points,
-        usdt: user.usdt,
-        invited: user.invited,
-        referrer: user.referrer,
-      });
-
-    // ✅ Open Box every 5 minutes
-    case "openBox":
-      const now = Date.now();
-      const waitBox = now - user.lastbox;
-
-      if (waitBox < 5 * 60 * 1000) {
-        return res.json({
-          error: "wait",
-          wait: Math.ceil((5 * 60 * 1000 - waitBox) / 1000),
-        });
+  try {
+    switch (action) {
+      case "openBox": {
+        const reward = await openBoxTx(userID);
+        if ("wait" in reward) return res.status(429).json(reward);
+        return res.status(200).json(reward);
       }
 
-      const reward = Math.floor(Math.random() * 40) + 10;
-
-      await supabase
-        .from("players")
-        .update({
-          points: user.points + reward,
-          lastbox: now,
-        })
-        .eq("user_id", userID);
-
-      return res.json({ success: true, reward });
-
-    // ✅ Bonus every 12 minutes
-    case "bonus":
-      const now2 = Date.now();
-      const waitBonus = now2 - user.lastbonus;
-
-      if (waitBonus < 12 * 60 * 1000) {
-        return res.json({
-          error: "wait",
-          wait: Math.ceil((12 * 60 * 1000 - waitBonus) / 1000),
-        });
-      }
-
-      const bonus = 200;
-
-      await supabase
-        .from("players")
-        .update({
-          points: user.points + bonus,
-          lastbonus: now2,
-        })
-        .eq("user_id", userID);
-
-      return res.json({ success: true, reward: bonus });
-
-    // ✅ Referral Info
-    case "refInfo":
-      return res.json({
-        success: true,
-        invited: user.invited,
-        referrer: user.referrer,
-      });
-
-    // ✅ Add referral manually
-    case "addRef":
-      if (!ref || ref === userID)
-        return res.json({ error: "Invalid ref" });
-
-      // update inviter
-      await supabase.rpc("add_referral", {
-        userid: userID,
-        referrerid: ref,
-      });
-
-      return res.json({ success: true });
-
-    // ✅ Withdraw
-    case "withdraw":
-      const { amount, address } = req.query;
-
-      if (!amount || !address)
-        return res.json({ error: "Missing params" });
-
-      return res.json({
-        success: true,
-        message: "Withdrawal request sent",
-      });
-
-    default:
-      return res.status(400).json({ error: "Invalid action" });
+      default:
+        return res.status(400).json({ error: "Invalid action" });
+    }
+  } catch (e: any) {
+    logger.error({ err: e, userID, action }, "Unhandled error");
+    return res.status(500).json({ error: "Internal server error" });
   }
+}
+
+/* ---------- 2. Transactional Box ---------- */
+async function openBoxTx(uid: string): Promise<BoxReward | WaitRes> {
+  return supabase.rpc("open_box_atomic", { p_user_id: uid }).then((r) => {
+    if (r.error) {
+      if (r.error.message.includes("wait")) {
+        const left = Number(r.error.message.split(" ")[1]);
+        return { error: "wait", wait: left };
+      }
+      throw r.error;
+    }
+    return { success: true, reward: r.data };
+  });
 }
