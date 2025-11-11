@@ -1,145 +1,141 @@
-import fs from "fs";
-import path from "path";
+import { createClient } from "@supabase/supabase-js";
 
-export default function handler(req, res) {
-  try {
-    const { action, userID, amount, address, ref } = req.query;
-    if (!action) return res.status(400).json({ error: "Missing action" });
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+);
 
-    const filePath = path.join(process.cwd(), "players.json");
+export default async function handler(req, res) {
+  res.setHeader("Content-Type", "application/json");
 
-    // ✅ إنشاء ملف players.json إذا لم يوجد
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, JSON.stringify({}), "utf8");
-    }
+  const { action, userID, ref } = req.query;
 
-    // ✅ قراءة اللاعبين
-    let players = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  if (!action || !userID) {
+    return res.status(400).json({ error: "Missing parameters" });
+  }
 
-    // ✅ تسجيل اللاعب إذا لم يكن موجود
-    if (userID && !players[userID]) {
-      players[userID] = {
-        points: 0,
-        usdt: 0,
-        ref: null,
-        invited: 0,
-        lastBox: 0,
-        lastBonus: 0,
-      };
+  // ✅ 1 — تأكد أن المستخدم موجود، وإن لم يوجد يتم إنشاؤه
+  async function getOrCreateUser() {
+    const { data: user } = await supabase
+      .from("players")
+      .select("*")
+      .eq("user_id", userID)
+      .single();
 
-      // ✅ نظام الإحالات
-      if (ref && ref !== userID) {
-        if (players[ref]) {
-          players[ref].invited++;
-          players[ref].points += 5000;
-        }
-        players[userID].ref = ref;
+    if (user) return user;
+
+    // ✅ Create new user
+    const newUser = {
+      user_id: userID,
+      points: 0,
+      usdt: 0,
+      invited: 0,
+      referrer: ref || null,
+      lastbox: 0,
+      lastbonus: 0,
+    };
+
+    await supabase.from("players").insert([newUser]);
+    return newUser;
+  }
+
+  const user = await getOrCreateUser();
+
+  // ✅ 2 — SYSTEM ACTIONS
+  switch (action) {
+
+    // ✅ Get Balance
+    case "getBalance":
+      return res.json({
+        success: true,
+        points: user.points,
+        usdt: user.usdt,
+        invited: user.invited,
+        referrer: user.referrer,
+      });
+
+    // ✅ Open Box every 5 minutes
+    case "openBox":
+      const now = Date.now();
+      const waitBox = now - user.lastbox;
+
+      if (waitBox < 5 * 60 * 1000) {
+        return res.json({
+          error: "wait",
+          wait: Math.ceil((5 * 60 * 1000 - waitBox) / 1000),
+        });
       }
 
-      fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
-    }
+      const reward = Math.floor(Math.random() * 40) + 10;
 
-    // ✅ اللاعب الحالي
-    const p = players[userID];
+      await supabase
+        .from("players")
+        .update({
+          points: user.points + reward,
+          lastbox: now,
+        })
+        .eq("user_id", userID);
 
-    // ✅ الأكشنات
-    switch (action) {
-      // ✅ جلب رصيد اللاعب
-      case "getBalance":
+      return res.json({ success: true, reward });
+
+    // ✅ Bonus every 12 minutes
+    case "bonus":
+      const now2 = Date.now();
+      const waitBonus = now2 - user.lastbonus;
+
+      if (waitBonus < 12 * 60 * 1000) {
         return res.json({
-          points: p.points,
-          usdt: p.usdt,
-          invited: p.invited,
-          lastBox: p.lastBox,
-          lastBonus: p.lastBonus,
+          error: "wait",
+          wait: Math.ceil((12 * 60 * 1000 - waitBonus) / 1000),
         });
+      }
 
-      // ✅ فتح صندوق كل 5 دقائق
-      case "openBox":
-        if (Date.now() - p.lastBox < 5 * 60 * 1000) {
-          return res.json({ error: "Wait 5 minutes" });
-        }
+      const bonus = 200;
 
-        const rewardBox = Math.floor(Math.random() * (200 - 50 + 1)) + 50;
-        p.points += rewardBox;
-        p.lastBox = Date.now();
-        fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
+      await supabase
+        .from("players")
+        .update({
+          points: user.points + bonus,
+          lastbonus: now2,
+        })
+        .eq("user_id", userID);
 
-        return res.json({ success: true, reward: rewardBox });
+      return res.json({ success: true, reward: bonus });
 
-      // ✅ بونص كل 12 دقيقة
-      case "bonus":
-        if (Date.now() - p.lastBonus < 12 * 60 * 1000) {
-          return res.json({ error: "Wait 12 minutes" });
-        }
+    // ✅ Referral Info
+    case "refInfo":
+      return res.json({
+        success: true,
+        invited: user.invited,
+        referrer: user.referrer,
+      });
 
-        p.points += 1000;
-        p.lastBonus = Date.now();
-        fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
+    // ✅ Add referral manually
+    case "addRef":
+      if (!ref || ref === userID)
+        return res.json({ error: "Invalid ref" });
 
-        return res.json({ success: true, reward: 1000 });
+      // update inviter
+      await supabase.rpc("add_referral", {
+        userid: userID,
+        referrerid: ref,
+      });
 
-      // ✅ مشاهدة إعلان
-      case "watchAd":
-        p.points += 150;
-        fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
-        return res.json({ success: true, reward: 150 });
+      return res.json({ success: true });
 
-      // ✅ إكمال مهمة
-      case "claimTask":
-        p.points += 10000;
-        fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
-        return res.json({ success: true, reward: 10000 });
+    // ✅ Withdraw
+    case "withdraw":
+      const { amount, address } = req.query;
 
-      // ✅ تحويل نقاط إلى USDT
-      case "swap":
-        const pts = parseInt(amount);
-        if (!pts || pts < 10000)
-          return res.status(400).json({ error: "Min 10,000 points" });
+      if (!amount || !address)
+        return res.json({ error: "Missing params" });
 
-        const usdt = ((pts / 10000) * 0.005).toFixed(3);
+      return res.json({
+        success: true,
+        message: "Withdrawal request sent",
+      });
 
-        p.points -= pts;
-        p.usdt += Number(usdt);
-        fs.writeFileSync(filePath, JSON.stringify(players, null, 2));
-
-        return res.json({ success: true, usdt });
-
-      // ✅ طلب سحب
-      case "withdraw":
-        if (!amount || !address)
-          return res.status(400).json({ error: "Missing params" });
-
-        const telegramToken =
-          "8222744961:AAE90Eehr8PqldV6oKxIS9Yo9hw69Zi83Us";
-        const chatID = "8447940021";
-
-        const msg = `🚨 New Withdrawal 🚨
-👤 User: ${userID}
-💰 Amount: ${amount} USDT
-📍 Polygon Address: <code>${address}</code>
-✅ Approve: <code>/approve ${address} ${amount}</code>
-❌ Reject: <code>/reject ${address} ${amount}</code>`;
-
-        fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: chatID,
-            text: msg,
-            parse_mode: "HTML",
-          }),
-        }).catch(() => {});
-
-        return res.json({
-          success: true,
-          message: "Withdrawal request sent to admin!",
-        });
-
-      default:
-        return res.status(400).json({ error: "Invalid action" });
-    }
-  } catch (e) {
-    return res.status(500).json({ error: "Server crashed", details: e + "" });
+    default:
+      return res.status(400).json({ error: "Invalid action" });
   }
 }
